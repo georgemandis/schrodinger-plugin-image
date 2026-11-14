@@ -23,6 +23,7 @@ pub struct Found {
 }
 
 impl Found {
+    #[cfg(test)]
     pub fn anything(&self) -> bool {
         self.has_exif || self.has_gps || self.has_xmp || self.has_iptc || self.has_comment
     }
@@ -187,6 +188,13 @@ pub fn strip_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
 // --- PNG --------------------------------------------------------------------
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+/// HEIC/HEIF (and AVIF, the same container): an ISO media file whose
+/// `ftyp` box names a still-image brand.
+pub fn is_heif(bytes: &[u8]) -> bool {
+    const BRANDS: &[&[u8; 4]] = &[b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1", b"avif"];
+    bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && BRANDS.iter().any(|b| &bytes[8..12] == *b)
+}
 
 pub fn is_png(bytes: &[u8]) -> bool {
     bytes.starts_with(PNG_SIGNATURE)

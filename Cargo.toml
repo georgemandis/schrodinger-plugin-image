@@ -1,6 +1,6 @@
 [package]
 name = "schrodinger-plugin-image"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Image conversion, metadata removal and resizing plugin for Schrödinger"
 license = "MIT"
@@ -13,8 +13,9 @@ schrodinger-plugin-sdk = { git = "https://github.com/georgemandis/schrodinger-pl
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 plist = "1"
+tempfile = "3"
+loupe-rs = { git = "https://github.com/georgemandis/loupe-rs" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "gif", "bmp", "webp"] }
 
 [dev-dependencies]
 png = "0.17"
-tempfile = "3"

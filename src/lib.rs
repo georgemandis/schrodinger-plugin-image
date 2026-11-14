@@ -8,6 +8,10 @@
 //!   Remove metadata   drop location, camera, timestamps and comments
 //!   As PNG / As JPEG  convert
 //!   Resize            fit within a size chosen in the plugin's settings
+//!   Remove background keep the subject, on a transparent background
+//!
+//! HEIC photos (the iPhone's default format) and background removal go
+//! through the operating system by way of loupe, so they work on macOS.
 
 use schrodinger_plugin_sdk::prelude::*;
 use schrodinger_plugin_sdk::schrodinger_plugin;
@@ -21,7 +25,8 @@ pub struct ImagePlugin;
 const PNG_FORMATS: &[&str] = &["public.png", "PNG", "image/png"];
 const JPEG_FORMATS: &[&str] = &["public.jpeg", "public.jpg", "image/jpeg", "JFIF"];
 const TIFF_FORMATS: &[&str] = &["public.tiff", "image/tiff"];
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "tif", "tiff", "gif", "bmp", "webp"];
+const HEIF_FORMATS: &[&str] = &["public.heic", "public.heif", "image/heic", "image/heif"];
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "tif", "tiff", "gif", "bmp", "webp", "heic", "heif"];
 /// Larger files are left alone; decoding them would stall the paste.
 const MAX_FILE_BYTES: u64 = 150 * 1024 * 1024;
 
@@ -153,7 +158,7 @@ fn source(entry: &ClipEntry) -> Result<Source, PluginError> {
     // Prefer the encoding the image arrived in: a JPEG on the clipboard is
     // the original file's bytes, metadata included, while a TIFF or PNG next
     // to it is usually a re-rendering the copying app added.
-    for names in [JPEG_FORMATS, PNG_FORMATS, TIFF_FORMATS] {
+    for names in [JPEG_FORMATS, HEIF_FORMATS, PNG_FORMATS, TIFF_FORMATS] {
         if let Some(bytes) = read_any(entry, names) {
             if !bytes.is_empty() {
                 return Ok(Source { bytes, file: None });
@@ -165,8 +170,49 @@ fn source(entry: &ClipEntry) -> Result<Source, PluginError> {
 
 // --- operations ---------------------------------------------------------------
 
+/// Hand the bytes to loupe as a file, which is what its API takes.
+fn with_temp_file<T>(bytes: &[u8], f: impl FnOnce(&Path) -> T) -> Result<T, PluginError> {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().map_err(|e| PluginError(format!("could not create a temporary file: {e}")))?;
+    file.write_all(bytes).and_then(|_| file.flush()).map_err(|e| PluginError(format!("could not write a temporary file: {e}")))?;
+    Ok(f(file.path()))
+}
+
+fn from_pixels(px: loupe_rs::Pixels) -> Result<image::DynamicImage, PluginError> {
+    image::RgbaImage::from_raw(px.width, px.height, px.rgba)
+        .map(image::DynamicImage::ImageRgba8)
+        .ok_or_else(|| PluginError::from("the system returned a malformed image"))
+}
+
+/// Decode with the operating system. Reads what the `image` crate cannot,
+/// HEIC above all, and returns the picture already upright.
+fn decode_with_system(bytes: &[u8]) -> Result<image::DynamicImage, PluginError> {
+    let px = with_temp_file(bytes, loupe_rs::load_pixels)?.map_err(|e| PluginError(format!("could not read this image: {e}")))?;
+    let img = from_pixels(px)?;
+    // Photos have no transparency; drop the unused alpha channel so they
+    // are treated as photos from here on.
+    Ok(if img.as_rgba8().is_some_and(|p| p.pixels().all(|p| p[3] == 255)) {
+        image::DynamicImage::ImageRgb8(img.to_rgb8())
+    } else {
+        img
+    })
+}
+
 fn decode(bytes: &[u8]) -> Result<image::DynamicImage, PluginError> {
-    let img = image::load_from_memory(bytes).map_err(|e| PluginError(format!("could not read this image: {e}")))?;
+    if metadata::is_heif(bytes) {
+        return decode_with_system(bytes).map_err(|e| {
+            if cfg!(target_os = "macos") {
+                e
+            } else {
+                PluginError::from("HEIC photos can only be read on macOS")
+            }
+        });
+    }
+    let img = match image::load_from_memory(bytes) {
+        Ok(img) => img,
+        // Something the `image` crate does not know; the system may.
+        Err(e) => return decode_with_system(bytes).map_err(|_| PluginError(format!("could not read this image: {e}"))),
+    };
     // Draw the picture the way it is meant to be seen. After this the
     // orientation tag is no longer needed (and re-encoding drops it).
     Ok(match metadata::inspect(bytes).orientation {
@@ -207,6 +253,7 @@ fn encode_jpeg(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>, Plugin
 pub struct Settings {
     pub max_size: u32,
     pub jpeg_quality: u8,
+    pub trim_cutout: bool,
 }
 
 impl Settings {
@@ -218,8 +265,41 @@ impl Settings {
             "Maximum" => 95,
             _ => 85,
         };
-        Settings { max_size, jpeg_quality }
+        let trim_cutout = config.get("cutoutSize").and_then(|v| v.as_str()) != Some("Keep the original size");
+        Settings { max_size, jpeg_quality, trim_cutout }
     }
+}
+
+/// Crop to the part of the image that is not transparent.
+fn trim_transparent(img: image::RgbaImage) -> image::RgbaImage {
+    // Ignore the faintest pixels: a soft mask leaves stray near-zero alpha
+    // far from the subject.
+    const VISIBLE: u8 = 8;
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+    for (x, y, p) in img.enumerate_pixels() {
+        if p[3] > VISIBLE {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+    }
+    if x0 > x1 {
+        return img;
+    }
+    image::imageops::crop_imm(&img, x0, y0, x1 - x0 + 1, y1 - y0 + 1).to_image()
+}
+
+fn cutout(bytes: &[u8], settings: &Settings) -> Result<Vec<u8>, PluginError> {
+    use loupe_rs::CutoutError;
+    let px = with_temp_file(bytes, loupe_rs::remove_background)?.map_err(|e| match e {
+        CutoutError::NoSubject => PluginError::from("No subject found to separate from the background"),
+        CutoutError::Unsupported => PluginError::from("Removing the background needs macOS 14 or later"),
+        CutoutError::Failed(why) => PluginError(format!("could not remove the background: {why}")),
+    })?;
+    let img = from_pixels(px)?.into_rgba8();
+    let img = if settings.trim_cutout { trim_transparent(img) } else { img };
+    encode_png(&image::DynamicImage::ImageRgba8(img))
 }
 
 /// Run one mode. Returns the new image, its kind, and a suffix describing
@@ -227,13 +307,17 @@ impl Settings {
 pub fn process(bytes: &[u8], mode: &str, settings: &Settings) -> Result<(Vec<u8>, Kind, String), PluginError> {
     let is_jpeg = metadata::is_jpeg(bytes);
     let is_png = metadata::is_png(bytes);
+    let is_heif = metadata::is_heif(bytes);
     match mode {
+        "cutout" => Ok((cutout(bytes, settings)?, Kind::Png, "-cutout".into())),
         "png" => Ok((encode_png(&decode(bytes)?)?, Kind::Png, String::new())),
         "jpeg" => Ok((encode_jpeg(&decode(bytes)?, settings.jpeg_quality)?, Kind::Jpeg, String::new())),
         "resize" => {
             let img = decode(bytes)?;
             let longest = img.width().max(img.height());
-            let kind = if is_jpeg { Kind::Jpeg } else { Kind::Png };
+            // A HEIC photo has no PNG-like use; it comes back as a JPEG.
+            let as_jpeg = is_jpeg || is_heif;
+            let kind = if as_jpeg { Kind::Jpeg } else { Kind::Png };
             if longest <= settings.max_size && (is_jpeg || is_png) && !metadata::inspect(bytes).needs_rotation() {
                 // Already small enough: don't re-compress for nothing.
                 return Ok((bytes.to_vec(), kind, String::new()));
@@ -243,7 +327,7 @@ pub fn process(bytes: &[u8], mode: &str, settings: &Settings) -> Result<(Vec<u8>
             } else {
                 img
             };
-            let out = if is_jpeg { encode_jpeg(&img, settings.jpeg_quality)? } else { encode_png(&img)? };
+            let out = if as_jpeg { encode_jpeg(&img, settings.jpeg_quality)? } else { encode_png(&img)? };
             Ok((out, kind, format!("-{}", settings.max_size)))
         }
         // "strip" and anything unrecognized
@@ -266,6 +350,11 @@ pub fn process(bytes: &[u8], mode: &str, settings: &Settings) -> Result<(Vec<u8>
                 if let Some(clean) = metadata::strip_png(bytes) {
                     return Ok((clean, Kind::Png, "-clean".into()));
                 }
+            }
+            if is_heif {
+                // HEIC cannot be cleaned in place. Decoding takes only the
+                // picture, so a high-quality JPEG of it carries nothing over.
+                return Ok((encode_jpeg(&decode(bytes)?, settings.jpeg_quality.max(92))?, Kind::Jpeg, "-clean".into()));
             }
             // TIFF, WebP and the rest: re-encoding as PNG keeps every pixel
             // and carries no metadata over.
@@ -347,7 +436,10 @@ fn write_file(change_count: i64, stem: &str, suffix: &str, kind: Kind, bytes: &[
 impl NativePlugin for ImagePlugin {
     fn analyze(&self, entry: &ClipEntry) -> Result<AnalysisData, PluginError> {
         let formats = &entry.meta.formats;
-        let pixels = has_any(formats, PNG_FORMATS) || has_any(formats, JPEG_FORMATS) || has_any(formats, TIFF_FORMATS);
+        let pixels = has_any(formats, PNG_FORMATS)
+            || has_any(formats, JPEG_FORMATS)
+            || has_any(formats, TIFF_FORMATS)
+            || has_any(formats, HEIF_FORMATS);
         let applies = pixels || copied_image_file(entry).is_some();
         Ok(if applies { AnalysisData::new().set("is_image", true) } else { AnalysisData::empty() })
     }
@@ -392,7 +484,7 @@ mod tests {
     use super::*;
     use metadata::tests::{plain_jpeg, tagged_jpeg, tagged_png};
 
-    const SETTINGS: Settings = Settings { max_size: 1600, jpeg_quality: 85 };
+    const SETTINGS: Settings = Settings { max_size: 1600, jpeg_quality: 85, trim_cutout: true };
 
     fn dims(bytes: &[u8]) -> (u32, u32) {
         let img = image::load_from_memory(bytes).unwrap();
@@ -457,7 +549,7 @@ mod tests {
 
     #[test]
     fn resize_fits_within_the_limit_and_keeps_the_format() {
-        let small = Settings { max_size: 100, jpeg_quality: 85 };
+        let small = Settings { max_size: 100, jpeg_quality: 85, trim_cutout: true };
         let (out, kind, suffix) = process(&plain_jpeg(400, 200), "resize", &small).unwrap();
         assert_eq!((kind, suffix.as_str()), (Kind::Jpeg, "-100"));
         assert_eq!(dims(&out), (100, 50));
@@ -488,6 +580,36 @@ mod tests {
         assert_eq!((s.max_size, s.jpeg_quality), (640, 95));
         let d = Settings::from(&serde_json::json!({}));
         assert_eq!((d.max_size, d.jpeg_quality), (1600, 85));
+        assert!(d.trim_cutout);
+        let keep = Settings::from(&serde_json::json!({ "cutoutSize": "Keep the original size" }));
+        assert!(!keep.trim_cutout);
+    }
+
+    #[test]
+    fn trims_to_the_visible_part() {
+        let mut img = image::RgbaImage::new(20, 10);
+        img.put_pixel(19, 0, image::Rgba([0, 0, 0, 3])); // too faint to count
+        for (x, y) in [(4, 2), (9, 6)] {
+            img.put_pixel(x, y, image::Rgba([10, 20, 30, 255]));
+        }
+        let out = trim_transparent(img);
+        assert_eq!((out.width(), out.height()), (6, 5));
+        assert_eq!(out.get_pixel(0, 0).0, [10, 20, 30, 255]);
+
+        let empty = trim_transparent(image::RgbaImage::new(4, 4));
+        assert_eq!((empty.width(), empty.height()), (4, 4), "nothing visible: left as is");
+    }
+
+    #[test]
+    fn recognizes_heic_by_its_header() {
+        let mut heic = vec![0, 0, 0, 24];
+        heic.extend_from_slice(b"ftypheic\0\0\0\0mif1heic");
+        assert!(metadata::is_heif(&heic));
+        let mut mp4 = vec![0, 0, 0, 24];
+        mp4.extend_from_slice(b"ftypisom\0\0\0\0isomiso2");
+        assert!(!metadata::is_heif(&mp4));
+        assert!(!metadata::is_heif(&plain_jpeg(4, 4)));
+        assert!(is_image_path(Path::new("/x/IMG_0001.HEIC")));
     }
 
     #[test]
@@ -507,13 +629,24 @@ mod real_file {
         let path = std::env::var("IMAGE_FILE").expect("set IMAGE_FILE");
         let bytes = std::fs::read(&path).unwrap();
         let before = super::metadata::inspect(&bytes);
-        let img = image::load_from_memory(&bytes).unwrap();
-        println!("input: {} bytes, {}x{}, {:?}", bytes.len(), img.width(), img.height(), before);
-        let settings = super::Settings { max_size: 1024, jpeg_quality: 85 };
-        for mode in ["strip", "png", "jpeg", "resize"] {
-            let (out, kind, suffix) = super::process(&bytes, mode, &settings).unwrap();
+        let img = super::decode(&bytes).unwrap();
+        println!("input: {} bytes, {}x{} upright, {:?}", bytes.len(), img.width(), img.height(), before);
+        let settings = super::Settings { max_size: 1024, jpeg_quality: 85, trim_cutout: true };
+        let out_dir = std::env::var("OUT_DIR_IMAGES").ok();
+        for mode in ["strip", "png", "jpeg", "resize", "cutout"] {
+            let started = std::time::Instant::now();
+            let (out, kind, suffix) = match super::process(&bytes, mode, &settings) {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("{mode:7} -> error: {}", e.0);
+                    continue;
+                }
+            };
             let o = image::load_from_memory(&out).unwrap();
-            println!("{mode:7} -> {:?}{suffix} {} bytes, {}x{}, metadata left: {}", kind, out.len(), o.width(), o.height(), super::metadata::inspect(&out).anything());
+            println!("{mode:7} -> {:?}{suffix} {} bytes, {}x{}, metadata left: {}, {:?}", kind, out.len(), o.width(), o.height(), super::metadata::inspect(&out).anything(), started.elapsed());
+            if let Some(dir) = &out_dir {
+                std::fs::write(format!("{dir}/{mode}.{}", kind.ext()), &out).unwrap();
+            }
         }
     }
 }
