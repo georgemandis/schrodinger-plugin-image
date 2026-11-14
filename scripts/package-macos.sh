@@ -25,8 +25,20 @@ mkdir -p "$OUT/lib"
 cp plugin.json "$OUT/"
 cp "target/release/$PLUGIN" "$OUT/lib/$PLUGIN"
 
-# The copy the build just linked against (newest, if several are cached).
-SRC=$(ls -t target/release/build/loupe-rs-*/out/libloupe.dylib | head -n1)
+# Where the loupe-rs build script put libloupe. Asked of cargo, because newer
+# cargo keeps build scripts' output outside target/.
+LOUPE_OUT=$(cargo build --release --message-format=json 2>/dev/null | python3 -c '
+import json, sys
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    if m.get("reason") == "build-script-executed" and "loupe-rs" in m.get("package_id", ""):
+        print(m["out_dir"])
+')
+SRC="$LOUPE_OUT/libloupe.dylib"
+[ -f "$SRC" ] || { echo "libloupe.dylib not found (looked in: $LOUPE_OUT)" >&2; exit 1; }
 cp "$SRC" "$OUT/lib/$LOUPE"
 
 install_name_tool -id "@rpath/$LOUPE" "$OUT/lib/$LOUPE"
