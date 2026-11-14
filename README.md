@@ -38,7 +38,7 @@ Other formats are re-encoded as PNG, which keeps every pixel and carries no meta
 ## Limits
 
 - One image at a time: several copied files are not handled yet.
-- HEIC and background removal are macOS only. On Windows and Linux the **Remove background** format is listed but reports that it is unavailable.
+- HEIC and background removal are macOS only. On Windows and Linux the **Remove background** format is not offered.
 - Converting to JPEG puts transparent areas on white.
 
 ## Building

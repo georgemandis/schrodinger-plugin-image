@@ -448,6 +448,11 @@ impl NativePlugin for ImagePlugin {
         entry.analysis().has("is_image")
     }
 
+    fn applies_to_mode(&self, _entry: &ClipEntry, mode: &str) -> bool {
+        // Background removal uses the operating system, and only macOS has it.
+        mode != "cutout" || cfg!(target_os = "macos")
+    }
+
     fn apply(&self, entry: &ClipEntry, mode: Option<&str>) -> Result<Vec<Output>, PluginError> {
         let src = source(entry)?;
         let settings = Settings::from(&entry.config());

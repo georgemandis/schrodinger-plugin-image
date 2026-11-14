@@ -415,8 +415,8 @@ dependencies = [
 
 [[package]]
 name = "schrodinger-plugin-sdk"
-version = "0.1.0"
-source = "git+https://github.com/georgemandis/schrodinger-plugin-sdk#76e64d1924bbed8ff2cf961546c97dbb85c02000"
+version = "0.2.0"
+source = "git+https://github.com/georgemandis/schrodinger-plugin-sdk#55d4e965ccc1649e02b329bba460f15c9ba1bcd2"
 dependencies = [
  "serde",
  "serde_json",
