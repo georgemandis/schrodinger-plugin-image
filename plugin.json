@@ -1,0 +1,36 @@
+{
+  "id": "image",
+  "name": "Image",
+  "version": "0.1.0",
+  "description": "Convert a copied image to PNG or JPEG, remove its metadata, or resize it",
+  "author": "georgemandis",
+  "type": "native",
+  "entry": {
+    "macos-arm64": "lib/libschrodinger_plugin_image.dylib",
+    "linux-x86_64": "lib/libschrodinger_plugin_image.so",
+    "windows-x86_64": "lib/schrodinger_plugin_image.dll"
+  },
+  "platforms": ["macos", "linux", "windows"],
+  "modes": [
+    { "id": "strip", "label": "Remove metadata", "default": true },
+    { "id": "png", "label": "As PNG" },
+    { "id": "jpeg", "label": "As JPEG" },
+    { "id": "resize", "label": "Resize" }
+  ],
+  "config": {
+    "maxSize": {
+      "type": "select",
+      "default": "1600",
+      "label": "Resize to fit within",
+      "description": "Longest side, in pixels. Images already smaller are left at their size.",
+      "options": ["640", "1024", "1600", "2048", "3840"]
+    },
+    "jpegQuality": {
+      "type": "select",
+      "default": "High",
+      "label": "JPEG quality",
+      "description": "Used whenever a JPEG has to be re-encoded.",
+      "options": ["Low", "Medium", "High", "Maximum"]
+    }
+  }
+}
